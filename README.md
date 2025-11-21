@@ -4,11 +4,11 @@
 
 By Athena
 
-&nbsp;  &nbsp; &nbsp;( ( ( ) ) )  <br>
-&nbsp;&nbsp;&nbsp; / \_\U_/ /\  <br>
-&nbsp; &nbsp;|  (o_o)  |  PBAP Extractor <br>
-&nbsp;&nbsp; | &nbsp; /\~_/\\ |  v5.0 <br>
-&nbsp; &nbsp;|_|  ~  |_|  by Athena <br>
+` ( ( ( ) ) )`  <br>
+` / \_\U_/ /\ ` <br>
+`|  (o_o)  |  PBAP Extractor `<br>
+`| /\~_/\\ |  v5.0 `<br>
+`|_|  ~  |_|  by Athena `<br>
 
 
 ---
