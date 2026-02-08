@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
+"""
+PBAP Extractor - Bluetooth Phone Book Access Profile Data Extraction Tool
+Author: Athena
+Version: 1.0.0
+License: MIT
+
+A professional tool for extracting contacts and call history from Bluetooth devices
+via the PBAP (Phone Book Access Profile) protocol using obexctl.
+"""
+
 import pexpect
 import sys
 import time
 import os
 import shutil
 import re
+from pathlib import Path
+import subprocess
 
-# ANSI Color codes for clean terminal output
+# ANSI Color codes for terminal output
 class Colors:
     CYAN = '\033[96m'
     GREEN = '\033[92m'
@@ -17,467 +29,599 @@ class Colors:
     BOLD = '\033[1m'
     DIM = '\033[2m'
     RESET = '\033[0m'
+    BG_BLUE = '\033[44m'
 
 # ---------------------------------------------------------
-# GLOBAL CONFIGURATION & STATE
+# CONFIGURATION
 # ---------------------------------------------------------
 
+VERSION = "1.0.0"
 TARGET_MAC = "" 
-MAX_RETRIES = 5
-MAX_ICH_FILES = 20 # Maximum number of call history files (e.g., 20 recent calls)
+MAX_RETRIES = 3
+CONSECUTIVE_FAILURES_LIMIT = 5  # Stop after 5 consecutive file not found
+WORK_DIR = os.getcwd()
+VCF_FOLDER = None
 
 # ---------------------------------------------------------
 # DISPLAY UTILITIES
 # ---------------------------------------------------------
 
 def print_banner():
-    # Kawaii Logo
-    kawaii_logo = f"""
+    """Display application banner."""
+    banner = f"""
 {Colors.MAGENTA}{Colors.BOLD}
-      ( ( ( ) ) )  
-     / \\_\\U_/ /\\  
-    |  (o_o)  |  PBAP Extractor
-    | /\\~_/\\ |  v5.0
-    |_|  ~  |_|  by Athena
+      ╔═══════════════════════════════════════╗
+      ║    ( ( ( ) ) )                        ║
+      ║   / \\_\\U_/ /\\                         ║
+      ║  |  (o_o)  |  PBAP Extractor          ║
+      ║  | /\\~_/\\ |  v{VERSION}                  ║
+      ║  |_|  ~  |_|  by Athena               ║
+      ╚═══════════════════════════════════════╝
 {Colors.RESET}"""
-    print(kawaii_logo)
-    
-    # Information Banner
-    banner_info = f"""
-{Colors.CYAN}{Colors.BOLD}
-╔═══════════════════════════════════════════════════════╗
-║  Bluetooth Data Extraction (PBAP/ICH) Pentest Tool    ║
-║  Target MAC: {TARGET_MAC}                             ║
-╚═══════════════════════════════════════════════════════╝
-{Colors.RESET}"""
-    print(banner_info)
+    print(banner)
+
+def print_header(title):
+    """Display section header."""
+    width = 70
+    print(f"\n{Colors.CYAN}{Colors.BOLD}{'═' * width}")
+    print(f"  {title.upper()}")
+    print(f"{'═' * width}{Colors.RESET}\n")
 
 def print_status(icon, message, color=Colors.CYAN):
+    """Display timestamped status message."""
     timestamp = time.strftime("%H:%M:%S", time.localtime())
     print(f"{Colors.DIM}[{timestamp}]{Colors.RESET} {color}{icon} {message}{Colors.RESET}")
 
-def print_progress(message):
-    print(f"{Colors.YELLOW}{'>' * 3} {message}{Colors.RESET}")
+def print_box(title, content, color=Colors.GREEN):
+    """Display message in a formatted box."""
+    width = 60
+    print(f"\n{color}{Colors.BOLD}╔{'═' * (width-2)}╗")
+    print(f"║ {title.center(width-4)} ║")
+    print(f"╠{'═' * (width-2)}╣")
+    for line in content:
+        print(f"║ {line.ljust(width-4)} ║")
+    print(f"╚{'═' * (width-2)}╝{Colors.RESET}\n")
 
 # ---------------------------------------------------------
-# OBEXCTL INTERACTION FUNCTIONS
+# BLUETOOTH SERVICE MANAGEMENT
 # ---------------------------------------------------------
 
-def wait_transfer(child, timeout=300):
-    """Waits for obexctl transfer status."""
+def check_bluetooth_service():
+    """
+    Verify that the Bluetooth service is active.
+    Attempts to start it if inactive.
+    """
+    print_status("⚙", "Checking Bluetooth services...", Colors.CYAN)
+    
+    try:
+        result = subprocess.run(['systemctl', 'is-active', 'bluetooth'], 
+                              capture_output=True, text=True)
+        if result.stdout.strip() != 'active':
+            print_status("⚠", "Bluetooth service not active, attempting to start...", Colors.YELLOW)
+            subprocess.run(['sudo', 'systemctl', 'start', 'bluetooth'], check=False)
+            time.sleep(2)
+        
+        print_status("✓", "Bluetooth service is active", Colors.GREEN)
+        return True
+    except Exception as e:
+        print_status("⚠", f"Cannot check Bluetooth service: {e}", Colors.YELLOW)
+        return True  # Continue anyway
+
+# ---------------------------------------------------------
+# FOLDER MANAGEMENT
+# ---------------------------------------------------------
+
+def create_vcf_folder():
+    """
+    Create a timestamped folder for VCF file storage.
+    Format: PBAP_YYYYMMDD_HHMMSS_MAC
+    """
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    mac_safe = TARGET_MAC.replace(':', '-')
+    folder_name = f"PBAP_{timestamp}_{mac_safe}"
+    folder_path = os.path.join(WORK_DIR, folder_name)
+    
+    try:
+        os.makedirs(folder_path, exist_ok=True)
+        print_status("📁", f"Created folder: {Colors.BOLD}{folder_name}{Colors.RESET}", Colors.GREEN)
+        return folder_path
+    except Exception as e:
+        print_status("✗", f"Cannot create folder: {e}", Colors.RED)
+        return None
+
+# ---------------------------------------------------------
+# FILE DETECTION & MANAGEMENT
+# ---------------------------------------------------------
+
+def find_downloaded_file(local_name, search_dirs, max_wait=4):
+    """
+    Search for a downloaded file in multiple possible locations.
+    Waits up to max_wait seconds for the file to appear.
+    
+    Args:
+        local_name: Filename to search for
+        search_dirs: List of directories to check
+        max_wait: Maximum wait time in seconds
+    
+    Returns:
+        Full path to file if found, None otherwise
+    """
+    start_time = time.time()
+    
+    while (time.time() - start_time) < max_wait:
+        for search_dir in search_dirs:
+            possible_path = os.path.join(search_dir, local_name)
+            
+            if os.path.exists(possible_path):
+                try:
+                    size = os.path.getsize(possible_path)
+                    if size > 0:
+                        time.sleep(0.15)  # Wait for file write completion
+                        return possible_path
+                except:
+                    pass
+        
+        time.sleep(0.3)
+    
+    return None
+
+def move_to_vcf_folder(source_path, final_name):
+    """
+    Move a file to the VCF output folder.
+    
+    Args:
+        source_path: Current file location
+        final_name: Destination filename
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        dest_path = os.path.join(VCF_FOLDER, final_name)
+        shutil.move(source_path, dest_path)
+        return True
+    except:
+        return False
+
+# ---------------------------------------------------------
+# OBEX PROTOCOL INTERACTION
+# ---------------------------------------------------------
+
+def wait_transfer(child, timeout=10):
+    """
+    Wait for OBEX transfer completion.
+    
+    Args:
+        child: pexpect spawn object
+        timeout: Maximum wait time
+    
+    Returns:
+        True if transfer successful, False otherwise
+    """
     try:
         i = child.expect([
             r"Pull successful",
-            r"Failed to copy",
+            r"Status: complete",
+            r"Transfer complete",
+            r"Failed",
             r"Error",
             pexpect.TIMEOUT
-        ], timeout=10)
+        ], timeout=timeout)
         
-        if i != 0:
-            return False
-        
-        i = child.expect([
-            r"Status: complete",
-            r"Status: error",
-            pexpect.TIMEOUT
-        ], timeout=10)
-        
-        if i != 0:
-            return False
-        
-        return True
-        
-    except (pexpect.TIMEOUT, pexpect.EOF):
+        return i <= 2
+    except:
         return False
 
-def cp_sequential(child, base_path, count_limit):
+def download_with_smart_detection(child, base_path):
     """
-    Copies VCF files sequentially (1.vcf, 2.vcf, ...) with conditional renaming 
-    for ICH files to avoid conflicts in the staging directory (uio/).
+    Download VCF files with intelligent failure detection.
+    Stops after CONSECUTIVE_FAILURES_LIMIT consecutive file-not-found errors.
+    
+    Args:
+        child: pexpect spawn object
+        base_path: PBAP directory path ('pb' for contacts, 'ich' for call history)
+    
+    Returns:
+        Number of successfully downloaded files
     """
-    print_status("⚡", f"Starting sequential copy mode for /{base_path}", Colors.MAGENTA)
+    print_status("⚡", f"Starting extraction from /{base_path}", Colors.MAGENTA)
+    print_status("⚙", f"Tolerance: {CONSECUTIVE_FAILURES_LIMIT} consecutive failures", Colors.CYAN)
     
-    file_count = 0
-    indices = range(1, count_limit + 1)
-    safety_limit = 1000 if base_path == 'pb' else MAX_ICH_FILES
+    # Possible locations where obexctl might save files
+    search_dirs = [
+        os.path.expanduser("~"),
+        os.getcwd(),
+        "/tmp",
+        os.path.join(os.path.expanduser("~"), "uio"),
+        "/root",
+    ]
     
-    for index in indices:
+    downloaded_count = 0
+    index = 1
+    consecutive_failures = 0
+    total_checked = 0
+    
+    max_limit = 5000 if base_path == 'pb' else 300
+    
+    print()
+    
+    while index <= max_limit and consecutive_failures < CONSECUTIVE_FAILURES_LIMIT:
         source_file = f"{index}.vcf"
+        local_name = f"tmp_{base_path}_{index}.vcf"
         
-        # Rename ICH files during transfer to avoid overwriting PB files
-        if base_path == 'ich':
-            dest_file = f"uio/CALL_{index}.vcf"
-        else: # 'pb'
-            dest_file = f"uio/{source_file}"
-        
-        print_status("→", f"Attempting: cp {source_file} → {dest_file}", Colors.CYAN)
-        
-        child.sendline(f"cp {source_file} {dest_file}")
-        
-        if wait_transfer(child, timeout=60):
-            print_status("✓", f"Successfully copied {source_file}", Colors.GREEN)
-            file_count += 1
+        # Generate final filename with zero-padding
+        if base_path == 'pb':
+            final_name = f"contact_{index:04d}.vcf"
         else:
-            print_status("⚠", f"Copy failed for {source_file} - assuming end of files", Colors.YELLOW)
-            if base_path == 'pb':
-                break
+            final_name = f"callhist_{index:04d}.vcf"
         
+        # Request file via OBEX
+        child.sendline(f"cp {source_file} {local_name}")
+        
+        # Wait for transfer
+        wait_transfer(child, timeout=10)
+        
+        # Consume prompt
         try:
-            child.expect("#", timeout=5)
+            child.expect("#", timeout=1)
         except:
             pass
         
-        if file_count >= safety_limit:
-            print_status("⚠", f"Reached safety limit of {safety_limit} files", Colors.YELLOW)
-            break
+        # Check if file actually exists
+        time.sleep(0.2)
+        file_path = find_downloaded_file(local_name, search_dirs, max_wait=4)
+        
+        total_checked += 1
+        
+        if file_path:
+            if move_to_vcf_folder(file_path, final_name):
+                downloaded_count += 1
+                consecutive_failures = 0  # Reset counter on success
+                
+                ratio = f"{downloaded_count}/{total_checked}"
+                print(f"\r{Colors.GREEN}✓ [{index:04d}] {final_name} {Colors.DIM}({ratio}){Colors.RESET}{' ' * 20}", end='')
+                sys.stdout.flush()
+            else:
+                consecutive_failures += 1
+        else:
+            consecutive_failures += 1
             
-        if base_path == 'ich' and index >= MAX_ICH_FILES:
-            break
+            if consecutive_failures <= 3:
+                print(f"\r{Colors.DIM}○ [{index:04d}] Not found (fail: {consecutive_failures}/{CONSECUTIVE_FAILURES_LIMIT}){' ' * 20}{Colors.RESET}", end='')
+                sys.stdout.flush()
+        
+        index += 1
+        time.sleep(0.1)
     
-    return file_count
+    print()
+    
+    if consecutive_failures >= CONSECUTIVE_FAILURES_LIMIT:
+        print_status("◆", f"Auto-stop: {CONSECUTIVE_FAILURES_LIMIT} consecutive failures reached", Colors.YELLOW)
+    
+    if total_checked > 0:
+        success_rate = (downloaded_count / total_checked) * 100
+        print_status("ℹ", f"Success rate: {downloaded_count}/{total_checked} ({success_rate:.1f}%)", Colors.CYAN)
+    
+    return downloaded_count
 
-def connect_and_download(target_path, file_limit):
-    """Establishes the OBEX PBAP/ICH connection and initiates download."""
-    print_progress(f"Spawning OBEX control session for {target_path.upper()}...")
-    child = pexpect.spawn("obexctl", encoding="utf-8", timeout=30)
-    # child.logfile = sys.stdout # Commented for cleaner output on GitHub
+def connect_and_extract(target_path):
+    """
+    Establish OBEX connection and extract data from specified path.
+    
+    Args:
+        target_path: PBAP directory ('pb' for contacts, 'ich' for call history)
+    
+    Returns:
+        True if extraction successful, False otherwise
+    """
+    print_header(f"Extracting {target_path.upper()} directory")
+    
+    # Brief pause to ensure services are ready
+    time.sleep(1)
+    
+    print_status("→", "Starting obexctl...", Colors.CYAN)
+    
+    child = pexpect.spawn("obexctl", encoding="utf-8", timeout=15, cwd=WORK_DIR)
 
     try:
-        child.expect("#")
-        print_status("→", f"Initiating connection to {Colors.BOLD}{TARGET_MAC}{Colors.RESET}", Colors.CYAN)
-        child.sendline(f"connect {TARGET_MAC} pbap") 
+        # Wait for initial prompt
+        child.expect("#", timeout=5)
         
+        print_status("→", f"Connecting to {Colors.BOLD}{TARGET_MAC}{Colors.RESET}...", Colors.CYAN)
+        child.sendline(f"connect {TARGET_MAC} pbap")
+        
+        # Wait for connection response
         i = child.expect([
             "Connection successful",
-            r"Failed to connect.*Error\.Failed",
+            "Client proxy not available",
+            "Failed",
             pexpect.TIMEOUT
-        ], timeout=30)
+        ], timeout=20)
+        
+        if i == 1:
+            # OBEX client not ready - wait and retry
+            print_status("⚠", "OBEX client not ready, waiting 3s...", Colors.YELLOW)
+            child.sendline("quit")
+            child.close()
+            time.sleep(3)
+            return False
         
         if i != 0:
             print_status("✗", "Connection failed", Colors.RED)
-            child.close(force=True)
+            child.sendline("quit")
+            child.close()
             return False
         
-        print_status("✓", "Handshake successful", Colors.GREEN)
-        child.expect("#")
-
-        print_progress(f"Navigating to directory: /{target_path}...")
+        print_status("✓", "Connected successfully", Colors.GREEN)
+        child.expect("#", timeout=3)
+        
+        # Navigate to target directory
+        print_status("→", f"Accessing /{target_path}...", Colors.CYAN)
         child.sendline(f"cd {target_path}")
-        child.expect("Select successful", timeout=10)
-        child.expect("#")
-        print_status("✓", f"Directory selected: /{target_path}", Colors.GREEN)
+        
+        i = child.expect(["Select successful", "Failed", "#"], timeout=5)
+        if i == 1:
+            print_status("✗", f"Cannot access /{target_path}", Colors.RED)
+            child.sendline("quit")
+            child.close()
+            return False
+        
+        child.expect("#", timeout=3)
+        print_status("✓", "Directory accessed", Colors.GREEN)
 
-        file_count = cp_sequential(child, target_path, file_limit)
+        # Download files
+        file_count = download_with_smart_detection(child, target_path)
+        
+        # Disconnect
+        child.sendline("quit")
+        try:
+            child.expect(pexpect.EOF, timeout=2)
+        except:
+            pass
+        child.close()
         
         if file_count > 0:
-            print_status("✓", f"Download complete - {file_count} file(s) copied from /{target_path}", Colors.GREEN)
-            time.sleep(0.5)
-            child.sendline("quit")
-            child.close(force=True)
-            print_status("■", "Session terminated", Colors.CYAN)
+            print_status("✓", f"{Colors.BOLD}{file_count}{Colors.RESET} files downloaded", Colors.GREEN)
             return True
         else:
-            print_status("✗", f"No files were copied from /{target_path}", Colors.RED)
-            child.close(force=True)
+            print_status("⚠", "No files downloaded", Colors.YELLOW)
             return False
         
-    except (pexpect.TIMEOUT, pexpect.EOF) as e:
-        print_status("✗", f"Operation failed for /{target_path}: {e}", Colors.RED)
+    except Exception as e:
+        print_status("✗", f"Error: {e}", Colors.RED)
         try:
+            child.sendline("quit")
             child.close(force=True)
         except:
             pass
         return False
 
 # ---------------------------------------------------------
-# POST-DOWNLOAD UTILITIES
-# ---------------------------------------------------------
-
-def move_contacts_file():
-    """
-    Relocates downloaded files from system temp/home directories ('uio/') 
-    to the current directory, renaming them to contact_N.vcf and callhist_N.vcf.
-    """
-    destination_dir = os.getcwd()
-    files_moved = 0
-    
-    print_progress("Relocating payload files...")
-    
-    # Common directories where obexctl might place files
-    source_dirs = [
-        os.path.expanduser("~"),
-        "/var/bluetooth/",
-        "/root/",
-        "/tmp/"
-    ]
-    
-    for source_dir in source_dirs:
-        uio_dir = os.path.join(source_dir, "uio")
-        
-        if not os.path.exists(uio_dir):
-            continue
-        
-        print_status("→", f"Checking directory: {uio_dir}", Colors.CYAN)
-        
-        # 1. Contacts (1.vcf, 2.vcf, ...) -> Renamed to contact_N.vcf
-        for i in range(1, 1001):
-            source = os.path.join(uio_dir, f"{i}.vcf")
-            destination = os.path.join(destination_dir, f"contact_{i}.vcf")
-            
-            if os.path.exists(source):
-                try:
-                    shutil.move(source, destination)
-                    print_status("✓", f"Relocated: uio/{i}.vcf → {Colors.BOLD}contact_{i}.vcf{Colors.RESET}", Colors.GREEN)
-                    files_moved += 1
-                except Exception as e:
-                    print_status("✗", f"Error moving uio/{i}.vcf: {e}", Colors.RED)
-
-        # 2. Call History (CALL_1.vcf, CALL_2.vcf, ...) -> Renamed to callhist_N.vcf
-        for i in range(1, MAX_ICH_FILES + 1):
-            source = os.path.join(uio_dir, f"CALL_{i}.vcf")
-            destination = os.path.join(destination_dir, f"callhist_{i}.vcf")
-
-            if os.path.exists(source):
-                try:
-                    shutil.move(source, destination)
-                    print_status("✓", f"Relocated: uio/CALL_{i}.vcf → {Colors.BOLD}callhist_{i}.vcf{Colors.RESET}", Colors.GREEN)
-                    files_moved += 1
-                except Exception as e:
-                    print_status("✗", f"Error moving uio/CALL_{i}.vcf: {e}", Colors.RED)
-
-        # Clean up the uio directory
-        try:
-            if not os.listdir(uio_dir):
-                os.rmdir(uio_dir)
-                print_status("◆", f"Cleaned up empty directory: {uio_dir}", Colors.DIM)
-        except OSError:
-            pass 
-    
-    if files_moved > 0:
-        print_status("◆", f"Total files moved: {files_moved}", Colors.CYAN)
-        return True
-    else:
-        print_status("⚠", f"No files found in uio/ subdirectories", Colors.YELLOW)
-        return False
-
-# ---------------------------------------------------------
-# VCF PARSING AND MERGING
+# VCF PARSING
 # ---------------------------------------------------------
 
 def parse_vcf(vcf_content):
     """
-    Parses the VCF content to extract Name, Phones, Emails, Org, and other 
-    detailed fields using regular expressions.
-    """
-    contact_data = {}
+    Parse VCF file content and extract contact information.
     
-    # Name (FN, N)
-    fn_match = re.search(r"FN:([^\n\r]+)", vcf_content, re.IGNORECASE)
-    if fn_match:
-        contact_data['Nom'] = fn_match.group(1).strip()
+    Args:
+        vcf_content: Raw VCF file content
+    
+    Returns:
+        Dictionary containing parsed contact data
+    """
+    data = {}
+    
+    # Parse name (FN or N field)
+    fn = re.search(r"FN:([^\n\r]+)", vcf_content, re.I)
+    if fn:
+        data['Name'] = fn.group(1).strip()
     else:
-        n_match = re.search(r"N:([^;\n\r]*);([^;\n\r]*);", vcf_content, re.IGNORECASE)
+        n_match = re.search(r"N:([^;\n\r]*);([^;\n\r]*);", vcf_content, re.I)
         if n_match:
-            prenom = n_match.group(2).strip()
-            nom = n_match.group(1).strip()
-            contact_data['Nom'] = f"{prenom} {nom}".strip() if prenom or nom else "UNKNOWN"
+            first = n_match.group(2).strip()
+            last = n_match.group(1).strip()
+            data['Name'] = f"{first} {last}".strip() or "UNKNOWN"
         else:
-            contact_data['Nom'] = "UNKNOWN"
-
-    # Phones (TEL)
-    tel_matches = re.findall(r"TEL(?:;[^:]*)*:([^\n\r]+)", vcf_content, re.IGNORECASE)
-    contact_data['Téléphones'] = [tel.strip().replace('-', '').replace(' ', '') for tel in tel_matches]
-
-    # Emails (EMAIL)
-    email_matches = re.findall(r"EMAIL(?:;[^:]*)*:([^\n\r]+)", vcf_content, re.IGNORECASE)
-    contact_data['Emails'] = [email.strip() for email in email_matches]
-
-    # Detailed Fields
-    org_match = re.search(r"ORG:([^\n\r]+)", vcf_content, re.IGNORECASE)
-    if org_match:
-        contact_data['Organisation'] = org_match.group(1).strip()
+            data['Name'] = "UNKNOWN"
     
-    title_match = re.search(r"TITLE:([^\n\r]+)", vcf_content, re.IGNORECASE)
-    if title_match:
-        contact_data['Titre'] = title_match.group(1).strip()
-        
-    note_match = re.search(r"NOTE:([^\n\r]+)", vcf_content, re.IGNORECASE | re.DOTALL)
-    if note_match:
-        contact_data['Note'] = note_match.group(1).strip()
-        
-    bday_match = re.search(r"BDAY:([^\n\r]+)", vcf_content, re.IGNORECASE)
-    if bday_match:
-        contact_data['Date de Naissance'] = bday_match.group(1).strip()
-
-    adr_matches = re.findall(r"ADR(?:;[^:]*)*:([^ \n\r]+)", vcf_content, re.IGNORECASE)
-    if adr_matches:
-        contact_data['Adresses'] = [addr.strip() for addr in adr_matches]
+    # Parse phone numbers
+    tel_matches = re.findall(r"TEL(?:;([^:]*))?: ?([^\n\r]+)", vcf_content, re.I)
+    phones = []
+    for type_info, number in tel_matches:
+        clean_num = number.strip().replace('-', '').replace(' ', '')
+        phones.append(clean_num)
+    data['Phones'] = phones
     
-    # Call History Fields (X-BT-CALL-TYPE & X-BT-CALL-DATE)
-    call_type_match = re.search(r"X-BT-CALL-TYPE:([^\n\r]+)", vcf_content, re.IGNORECASE)
-    if call_type_match:
-        contact_data['Type d\'Appel'] = call_type_match.group(1).strip()
-        
-    call_date_match = re.search(r"X-BT-CALL-DATE:([^\n\r]+)", vcf_content, re.IGNORECASE)
-    if call_date_match:
-        contact_data['Date d\'Appel'] = call_date_match.group(1).strip()
+    # Parse emails
+    data['Emails'] = re.findall(r"EMAIL(?:;[^:]*)*:([^\n\r]+)", vcf_content, re.I)
     
-    return contact_data
+    # Parse organization
+    org = re.search(r"ORG:([^\n\r]+)", vcf_content, re.I)
+    if org:
+        data['Organization'] = org.group(1).strip()
+    
+    # Parse call history specific fields
+    ct = re.search(r"X-BT-CALL-TYPE:([^\n\r]+)", vcf_content, re.I)
+    if ct:
+        data['CallType'] = ct.group(1).strip()
+    
+    cd = re.search(r"X-BT-CALL-DATE:([^\n\r]+)", vcf_content, re.I)
+    if cd:
+        data['CallDate'] = cd.group(1).strip()
+    
+    return data
 
-def parse_merge_and_cleanup():
+def generate_summary():
     """
-    Parses individual VCF files, merges the extracted data into a single file, 
-    and deletes the original VCF files.
+    Generate a text summary report from all extracted VCF files.
+    
+    Returns:
+        True if summary generated successfully, False otherwise
     """
-    output_file = "contacts_and_calls_parsed_merged.txt"
-    vcf_files = sorted([f for f in os.listdir('.') if f.endswith(".vcf") and (f.startswith("contact_") or f.startswith("callhist_"))])
+    output_file = os.path.join(VCF_FOLDER, "EXTRACTION_SUMMARY.txt")
+    
+    vcf_files = sorted([
+        f for f in os.listdir(VCF_FOLDER) 
+        if f.endswith(".vcf") and (f.startswith("contact_") or f.startswith("callhist_"))
+    ])
 
     if not vcf_files:
-        print_status("⚠", "No VCF files found for merging.", Colors.YELLOW)
         return False
 
-    print_progress("Parsing and merging VCF files (Contacts & Calls) into a single text file...")
+    print_header("Generating Summary Report")
+    print_status("📝", f"Processing {len(vcf_files)} VCF files...", Colors.CYAN)
     
-    parsed_count = 0
-
-    with open(output_file, "w", encoding="utf-8") as outfile:
+    contact_count = 0
+    call_count = 0
+    
+    with open(output_file, "w", encoding="utf-8") as out:
+        # Write header
+        out.write("=" * 80 + "\n")
+        out.write("PBAP EXTRACTION SUMMARY REPORT\n")
+        out.write("=" * 80 + "\n")
+        out.write(f"Date & Time    : {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        out.write(f"Target Device  : {TARGET_MAC}\n")
+        out.write(f"Total Files    : {len(vcf_files)}\n")
+        out.write(f"Output Folder  : {VCF_FOLDER}\n")
+        out.write("=" * 80 + "\n\n")
+        
+        # Process each VCF file
         for vcf in vcf_files:
+            is_contact = vcf.startswith("contact_")
+            
+            if is_contact:
+                contact_count += 1
+                header = f"CONTACT #{contact_count}"
+            else:
+                call_count += 1
+                header = f"CALL HISTORY #{call_count}"
+            
             try:
-                with open(vcf, "r", encoding="utf-8") as infile:
-                    content = infile.read()
-
+                with open(os.path.join(VCF_FOLDER, vcf), "r", encoding="utf-8", errors='ignore') as f:
+                    content = f.read()
+                
                 data = parse_vcf(content)
                 
-                is_call_hist = vcf.startswith("callhist_")
+                out.write("─" * 80 + "\n")
+                out.write(f"  {header} - {vcf}\n")
+                out.write("─" * 80 + "\n")
                 
-                # Header
-                header = "CALL HISTORY" if is_call_hist else "CONTACT"
-                outfile.write(f"*** {header} {parsed_count + 1} ({vcf}) ***\n")
+                # Call history specific fields
+                if 'CallType' in data:
+                    out.write(f"  Call Type      : {data['CallType']}\n")
+                    out.write(f"  Call Date/Time : {data.get('CallDate', 'N/A')}\n")
+                    out.write("\n")
                 
-                # Specific Call History fields (Using .format() for safety)
-                if is_call_hist:
-                    outfile.write("TYPE D'APPEL : {}\n".format(data.get("Type d'Appel", 'N/A')))
-                    outfile.write("DATE D'APPEL : {}\n".format(data.get("Date d'Appel", 'N/A')))
-                    
-                # Core Contact fields
-                outfile.write(f"NOM : {data.get('Nom', 'N/A')}\n")
-                tels = ", ".join(data.get('Téléphones', []))
-                outfile.write(f"TÉLÉPHONES : {tels if tels else 'N/A'}\n")
-                emails = ", ".join(data.get('Emails', []))
-                outfile.write(f"EMAILS : {emails if emails else 'N/A'}\n")
+                # Common fields
+                out.write(f"  Name           : {data['Name']}\n")
                 
-                # Other fields
-                other_info = []
-                if 'Organisation' in data:
-                    other_info.append(f"Organisation: {data['Organisation']}")
-                if 'Titre' in data:
-                    other_info.append(f"Titre/Poste: {data['Titre']}")
-                if 'Date de Naissance' in data:
-                    other_info.append(f"Date de Naissance: {data['Date de Naissance']}")
-                if 'Adresses' in data:
-                    other_info.append(f"Adresse(s): {'; '.join(data['Adresses'])}")
-                if 'Note' in data:
-                    note_content = data['Note'].replace('\n', ' ').strip()
-                    other_info.append(f"Note: {note_content[:100]}{'...' if len(note_content) > 100 else ''}")
+                if data['Phones']:
+                    out.write(f"  Phone(s)       : {', '.join(data['Phones'])}\n")
+                
+                if data['Emails']:
+                    out.write(f"  Email(s)       : {', '.join(data['Emails'])}\n")
+                
+                if 'Organization' in data:
+                    out.write(f"  Organization   : {data['Organization']}\n")
+                
+                out.write("\n")
+                
+            except:
+                continue
+        
+        # Write footer
+        out.write("=" * 80 + "\n")
+        out.write(f"SUMMARY: {contact_count} Contacts | {call_count} Call History Entries\n")
+        out.write("=" * 80 + "\n")
 
-                if other_info:
-                    outfile.write("AUTRES INFOS :\n")
-                    for info in other_info:
-                        outfile.write(f"  - {info}\n")
-                else:
-                    outfile.write("AUTRES INFOS : N/A\n")
-                
-                outfile.write("-" * 30 + "\n\n")
-                parsed_count += 1
-                
-            except Exception as e:
-                print_status("✗", f"Error reading or parsing {vcf}: {e}", Colors.RED)
-
-    print_status("✓", f"File generated: {Colors.BOLD}{output_file}{Colors.RESET} ({parsed_count} records)", Colors.GREEN)
-
-    print_progress("Deleting individual VCF files...")
-    for vcf in vcf_files:
-        try:
-            os.remove(vcf)
-            print_status("✗", f"Deleted: {vcf}", Colors.CYAN)
-        except Exception as e:
-            print_status("⚠", f"Error deleting {vcf}: {e}", Colors.YELLOW)
-
-    print_status("◆", "Merging and cleanup complete", Colors.GREEN)
+    print_status("✓", "Summary report created", Colors.GREEN)
+    
+    stats = [
+        f"Total VCF Files: {len(vcf_files)}",
+        f"Contacts: {contact_count}",
+        f"Call History: {call_count}",
+        f"Location: {os.path.basename(VCF_FOLDER)}",
+    ]
+    
+    print_box("EXTRACTION STATISTICS", stats, Colors.GREEN)
+    
     return True
 
-
 # ---------------------------------------------------------
-# MAIN EXECUTION
+# MAIN PROGRAM
 # ---------------------------------------------------------
 
 def validate_mac(mac_address):
-    """Simple MAC address validation."""
-    return re.match(r'^([0-9A-F]{2}[:-]){5}([0-9A-F]{2})$', mac_address)
+    """Validate MAC address format."""
+    return re.match(r'^([0-9A-F]{2}[:-]){5}([0-9A-F]{2})$', mac_address, re.I)
 
 def main():
+    """Main program entry point."""
+    global TARGET_MAC, VCF_FOLDER
     
-    global TARGET_MAC 
+    os.system('clear')
+    print_banner()
     
-    # 1. Get MAC Address Input
+    info = [
+        f"Working Directory: {WORK_DIR}",
+        f"Failure Tolerance: {CONSECUTIVE_FAILURES_LIMIT} consecutive failures",
+        f"Max Retries: {MAX_RETRIES}",
+    ]
+    print_box("CONFIGURATION", info, Colors.CYAN)
+    
+    # Check Bluetooth service
+    check_bluetooth_service()
+    
+    # Get target MAC address
     while True:
-        os.system('clear')
-        print_banner()
-        mac_address = input(f"{Colors.BLUE}{Colors.BOLD}Enter the target device MAC address (e.g., 12:34:56:78:90:AB) : {Colors.RESET}").strip().upper()
+        TARGET_MAC = input(f"\n{Colors.BLUE}{Colors.BOLD}Enter Target MAC Address: {Colors.RESET}").strip().upper()
         
-        if validate_mac(mac_address):
-            TARGET_MAC = mac_address.replace('-', ':') 
+        if validate_mac(TARGET_MAC):
+            TARGET_MAC = TARGET_MAC.replace('-', ':')
             break
         else:
-            print_status("⚠", "Invalid MAC format. Please try again.", Colors.YELLOW)
-            time.sleep(1)
-
-    # 2. Start Execution
-    os.system('clear')
-    print_banner() 
-    print_status("◆", f"Target device: {Colors.BOLD}{TARGET_MAC}{Colors.RESET}", Colors.CYAN)
-    print_status("◆", f"Max retry attempts: {Colors.BOLD}{MAX_RETRIES}{Colors.RESET}", Colors.CYAN)
-    print_status("◆", "Strategy: PBAP (Contacts) and ICH (Call History) extraction", Colors.MAGENTA)
-    print()
+            print_status("✗", "Invalid MAC format (use XX:XX:XX:XX:XX:XX)", Colors.RED)
     
-    success_contact = False
-    success_call_hist = False
+    print_status("✓", f"Target: {Colors.BOLD}{TARGET_MAC}{Colors.RESET}", Colors.GREEN)
     
+    # Create output folder
+    VCF_FOLDER = create_vcf_folder()
+    if not VCF_FOLDER:
+        sys.exit(1)
+    
+    success_contacts = False
+    success_calls = False
+    
+    # Extraction loop with retries
     for attempt in range(1, MAX_RETRIES + 1):
-        print(f"\n{Colors.BLUE}{Colors.BOLD}{'─' * 55}")
-        print(f"  ATTEMPT {attempt}/{MAX_RETRIES}")
-        print(f"{'─' * 55}{Colors.RESET}\n")
+        print(f"\n{Colors.BG_BLUE}{Colors.BOLD} ATTEMPT {attempt}/{MAX_RETRIES} {Colors.RESET}\n")
         
-        # 1. DOWNLOAD CONTACTS (pb directory)
-        if not success_contact:
-            print(f"\n{Colors.MAGENTA}--- 1. CONTACTS (PB) --{Colors.RESET}")
-            success_contact = connect_and_download("pb", 1000)
+        # Extract contacts
+        if not success_contacts:
+            success_contacts = connect_and_extract("pb")
         
-        # 2. DOWNLOAD CALL HISTORY (ich directory)
-        if not success_call_hist:
-            print(f"\n{Colors.MAGENTA}--- 2. CALL HISTORY (ICH) --{Colors.RESET}")
-            success_call_hist = connect_and_download("ich", MAX_ICH_FILES)
+        # Extract call history
+        if not success_calls:
+            success_calls = connect_and_extract("ich")
         
-        # Check if at least one operation succeeded
-        if success_contact or success_call_hist:
-            if move_contacts_file():
-                parse_merge_and_cleanup()
-
-                print(f"\n{Colors.GREEN}{Colors.BOLD}╔═══════════════════════════════════════════════════════╗")
-                print(f"║             OPERATION SUCCESSFUL                      ║")
-                print(f"╚═══════════════════════════════════════════════════════╝{Colors.RESET}\n")
+        # Check if extraction succeeded
+        if success_contacts or success_calls:
+            if generate_summary():
+                result = [
+                    "✓ Extraction completed successfully",
+                    f"✓ Files saved in: {os.path.basename(VCF_FOLDER)}",
+                ]
+                print_box("SUCCESS", result, Colors.GREEN)
                 sys.exit(0)
-            else:
-                print_status("⚠", "Download succeeded but file relocation/parsing failed", Colors.YELLOW)
-                sys.exit(1)
         
+        # Wait before retry
         if attempt < MAX_RETRIES:
-            print_status("⟳", "Retrying in 2 seconds...", Colors.YELLOW)
-            time.sleep(2)
+            print_status("⟳", "Retrying in 3 seconds...", Colors.YELLOW)
+            time.sleep(3)
     
-    print(f"\n{Colors.RED}{Colors.BOLD}╔═══════════════════════════════════════════════════════╗")
-    print(f"║     OPERATION FAILED AFTER {MAX_RETRIES} ATTEMPTS             ║")
-    print(f"╚═══════════════════════════════════════════════════════╝{Colors.RESET}\n")
+    # All attempts failed
+    print_box("EXTRACTION FAILED", [f"Failed after {MAX_RETRIES} attempts"], Colors.RED)
     sys.exit(1)
 
 if __name__ == "__main__":
