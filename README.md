@@ -31,6 +31,9 @@ It uses `obexctl` to manage the Bluetooth connection and features built-in logic
 2.  **Run:** Execute with `sudo python3 script.py`.
 3.  **Input:** The script will prompt for the **target MAC address**.
 
+
+## 🐛 Bug
+Remains stuck at 79 downloads
 ###### put to good use #####
 ╭∩╮(-_-)╭∩╮
 ######
